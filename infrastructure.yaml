@@ -1,0 +1,632 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudFormation stack for the Investment Insights Dashboard backend,
+  including S3, EC2 with Python script setup and cron, Glue Database, and Glue Crawlers.
+
+Parameters:
+  InstanceTypeParameter:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type for the data collector VM.
+  KeyPairNameParameter:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance.
+  YourIPAddressCIDRParameter:
+    Type: String
+    Description: Your current public IP address in CIDR notation (e.g., 1.2.3.4/32) for SSH access.
+  GeminiAPIKeyParameter:
+    Type: String
+    NoEcho: true
+    Description: Your Google Gemini API Key.
+  LatestAmazonLinuxAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Latest Amazon Linux 2023 AMI ID for your region (e.g., ami-xxxxxxxxxxxxxxxxx).
+
+Resources:
+  # --- S3 Bucket ---
+  StockDataS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: stock-data-collection-bucket # Your exact bucket name
+      Tags:
+        - Key: Name
+          Value: StockDataCollectionBucket
+        - Key: Project
+          Value: InvestmentDashboard
+
+  # --- IAM Role for EC2 Instance ---
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2-StockCollector-Role-CFN
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2S3AndSecretsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow # Permissions for the script to write to its data and archive folders
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:ListBucket" # Needed for awswrangler operations
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:AbortMultipartUpload"
+                Resource:
+                  - !Sub "arn:aws:s3:::${StockDataS3Bucket}/*" # Objects in the bucket
+                  - !Sub "arn:aws:s3:::${StockDataS3Bucket}"   # The bucket itself for ListBucket
+      Tags:
+        - Key: Name
+          Value: EC2-StockCollector-Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: EC2-StockCollector-InstanceProfile-CFN
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # --- EC2 Security Group ---
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: StockCollector-SG-CFN
+      GroupDescription: Allow SSH access from specified IP
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref YourIPAddressCIDRParameter
+      Tags:
+        - Key: Name
+          Value: StockCollector-SG
+
+  # --- EC2 Instance ---
+  DataCollectorInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeParameter
+      KeyName: !Ref KeyPairNameParameter
+      ImageId: !Ref LatestAmazonLinuxAmiId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt EC2SecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: InvestmentDataCollectorVM-CFN
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update system and install tools
+          yum update -y
+          yum install python3 python3-pip cronie git -y # Added git just in case for future
+
+          # Enable and start cron daemon
+          systemctl enable crond
+          systemctl start crond
+
+          # Create project directory
+          mkdir -p /home/ec2-user/stock_collector
+          cd /home/ec2-user/stock_collector
+
+          # Create requirements.txt file
+          cat << EOF > requirements.txt
+          pandas
+          yfinance==0.2.55
+          google-generativeai
+          numpy
+          requests
+          boto3
+          awswrangler
+          EOF
+
+          # Create Python script file (stockCollectionFunction.py)
+          cat << EOF > stockCollectionFunction.py
+          import os
+          import pandas as pd
+          import numpy as np
+          import json
+          import time
+          from datetime import date, timedelta 
+          import google.generativeai as genai
+          import yfinance as yf
+          import awswrangler as wr
+          import logging
+          import sys
+
+          # --- Configuration ---
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+          # --- AWS Configuration ---
+          S3_BUCKET_NAME = "stock-data-collection-bucket"
+          S3_BASE_FOLDER = "collected_data"
+          S3_ARCHIVE_PATH_BASE = f"s3://{S3_BUCKET_NAME}/{S3_BASE_FOLDER}/archive/"
+          S3_LATEST_PATH_BASE = f"s3://{S3_BUCKET_NAME}/{S3_BASE_FOLDER}/latest/"
+
+          # --- Gemini Configuration ---
+          API_KEY = os.getenv('GEMINI_API_KEY')
+          if not API_KEY:
+              logging.error("GEMINI_API_KEY environment variable not set. Please set it and retry.")
+              sys.exit(1)
+
+          genai.configure(api_key=API_KEY)
+          MODEL_NAME = 'gemini-1.5-flash'
+
+          # --- Ticker List (Same as before) ---
+          ticker_name_list = [
+              ("ADSK", "Autodesk, Inc."), ("AI", "C3.ai, Inc."), ("AMD", "Advanced Micro Devices, Inc."),
+              ("AMZN", "Amazon.com, Inc."), ("ANET", "Arista Networks, Inc."), ("ASML", "ASML Holding N.V."),
+              ("AVGO", "Broadcom Inc."), ("BIDU", "Baidu, Inc."), ("CNQ.TO", "Canadian Natural Resources Limited"),
+              ("CRWD", "CrowdStrike Holdings, Inc."), ("CTSH", "Cognizant Technology Solutions Corporation"),
+              ("DDOG", "Datadog, Inc."), ("DIS", "The Walt Disney Company"), ("DLB", "Dolby Laboratories, Inc."),
+              ("DOL.TO", "Dollarama"), ("ENB", "Enbridge Inc."), ("GOOG", "Alphabet Inc."), ("GSY.TO", "Goeasy Ltd."),
+              ("HIVE", "HIVE Blockchain Technologies Ltd."), ("INTC", "Intel Corporation"), ("LRCX", "Lam Research Corporation"),
+              ("META", "Meta Platforms, Inc."), ("MRNA", "Moderna, Inc."), ("MSFT", "Microsoft Corporation"),
+              ("MU", "Micron Technology, Inc."), ("NIO", "NIO Inc."), ("NVDA", "NVIDIA Corporation"),
+              ("NXPI", "NXP Semiconductors N.V."), ("PLTR", "Palantir Technologies Inc."),
+              ("RBRK", "Berkshire Hathaway Inc. (Class B)"), ("SMCI", "Super Micro Computer, Inc."),
+              ("TD.TO", "The Toronto-Dominion Bank"), ("TSM", "Taiwan Semiconductor Manufacturing Company Limited"),
+              ("TXN", "Texas Instruments Incorporated"), ("V", "Visa Inc."), ("WCN", "Waste Connections, Inc."),
+              ("SOL", "Renesola Ltd."), ("BBD-B.TO", "Bombardier Inc."), ("CEU.TO", "Cenovus Energy Inc."),
+              ("CLS.TO", "Celestica Inc."), ("XMTR", "Xometry, Inc."), ("PRLB", "Protolabs, Inc."),
+              ("KEI.TO", "Kolibri Global Energy Inc."), ("CHRW", "C.H. Robinson Worldwide, Inc."),
+              ("ALTI", "Altair Engineering Inc."), ("QCOM", "QUALCOMM Incorporated"), ("MRVL", "Marvell Technology, Inc."),
+              ("RY.TO", "Royal Bank of Canada"), ("CM.TO", "Canadian Imperial Bank of Commerce (CIBC)"),
+              ("BNS.TO", "The Bank of Nova Scotia"), ("BMO.TO", "Bank of Montreal"), ("CAVA", "Cava Group, Inc."),
+              ("BROS", "Dutch Bros Inc."), ("HOOD", "Robinhood Markets, Inc."), ("DPM.TO", "Dundee Precious Metals Inc."),
+              ("MG.TO", "Magna International Inc."), ("T.TO", "TELUS Corporation"), ("COST", "Costco Wholesale Corporation"),
+              ("AMAT", "Applied Materials, Inc."), ("KLAC", "KLA Corporation"), ("TER", "Teradyne"),
+              ("TIXT.TO", "TELUS International"), ("SNPS", "Synopsys"), ("CDNS", "Cadence Design Systems"),
+              ('DOW', 'Dow Inc.'), ('LYB', 'LyondellBasell Industries'), ('DD', 'DuPont de Nemours, Inc.'),
+              ('APD', 'Air Products and Chemicals'), ('EMN', 'Eastman Chemical Company'), ('CE', 'Celanese Corporation'),
+              ('WLK', 'Westlake Chemical Corporation'), ('PPG', 'PPG Industries'), ('MOS', 'Mosaic Company'),
+              ('CF', 'CF Industries Holdings, Inc.'), ('NTR', 'Nutrien Ltd. '), ('MX', 'Methanex Corporation '),
+              ('LIN', 'Linde plc'), ('TRP.TO', 'Transcanada Pipeline'),
+          ]
+
+          # --- Gemini Prompts (Same as before) ---
+          daily_global_news_prompt = """
+          Generate a Python dictionary where keys are globally relevant news topics discussed
+          in the last 24 hours across major financial news sources worldwide. Values are sentiment
+          scores on a scale of 0 to 100, where 0 is extremely negative and 100 is extremely positive.
+            Include at least 10 of the most talked about topics, considering economic, political,
+            and social factors that could impact global markets.
+            Display only the output as a python dictionary like this only as text:
+            {"Topic1":65, "Topic2":75, "Topic3":85, "Topic4":95, "Topic5":100, "Topic6":90, "Topic7":80, "Topic8":70, "Topic9":60, "Topic10":50}
+          """
+
+          company_news_prompt = """Generate a Python Dictionary Keys being the Topic and Value being
+                a Sentiment Prediction of the New of the company {Company}
+                Produce a sentiment evaluation from the past 24hrs of how it relates to
+                Revenue, Management, Legal, Technology and Financial.
+                Use these exact names as the keys: "Revenue", "Management", "Legal", "Technology", "Financial".
+                  Rating from 0 to 100. 0 Most negative, 100 Most positive.
+                Display ONLY the output as a python dictionary like this only as text:
+                {"Revenue": 75, "Management": 85, "Legal": 60, "Technology": 90, "Financial": 80}
+          """
+
+          # --- Helper Functions ---
+
+          def load_latest_historical_csv_from_s3(base_name, s3_archive_path_base, days_to_check=30):
+              """
+              Loads the most recent YYYY-MM-DD_base_name.csv file from the S3 archive.
+              Tries to find a file from today back to 'days_to_check' days ago.
+              """
+              s3_archive_folder = f"{s3_archive_path_base}{base_name}/"
+              logging.info(f"Attempting to load latest historical CSV for '{base_name}' from {s3_archive_folder}")
+
+              latest_file_path = None
+              latest_date_found = None
+
+              # List objects in the specific archive folder
+              try:
+                  # Check files from today going backwards
+                  for i in range(days_to_check + 1): # Check today and up to 'days_to_check' past days
+                      current_check_date = date.today() - timedelta(days=i)
+                      date_str = current_check_date.strftime('%Y-%m-%d')
+                      potential_file_name = f"{date_str}_{base_name}.csv"
+                      potential_file_path = f"{s3_archive_folder}{potential_file_name}"
+                      
+                      if wr.s3.does_object_exist(path=potential_file_path):
+                          latest_file_path = potential_file_path
+                          latest_date_found = current_check_date
+                          logging.info(f"Found most recent historical file: {latest_file_path}")
+                          break # Found the most recent one
+              except Exception as e:
+                  logging.warning(f"Error listing objects in {s3_archive_folder}: {e}. Will proceed as if no historical data exists.")
+                  return pd.DataFrame()
+
+              if latest_file_path:
+                  try:
+                      df_historical = wr.s3.read_csv(path=latest_file_path)
+                      logging.info(f"Successfully loaded historical data from {latest_file_path} with shape {df_historical.shape}")
+                      return df_historical
+                  except Exception as e:
+                      logging.error(f"Failed to read historical CSV from {latest_file_path}: {e}")
+                      return pd.DataFrame() # Return empty DF if read fails
+              else:
+                  logging.info(f"No recent historical CSV found for '{base_name}' in the last {days_to_check} days.")
+                  return pd.DataFrame()
+
+
+          def save_combined_to_s3_csv(df, base_name, today_str, s3_archive_path_base, s3_latest_path_base):
+              """
+              Saves the combined DataFrame to S3:
+              1. As a new dated archive file (YYYY-MM-DD_base_name.csv) into its respective archive subfolder.
+              2. As the 'latest' file (base_name.csv) into its respective 'latest' subfolder, overwriting it.
+              """
+              if df is None or df.empty:
+                  logging.warning(f"Combined DataFrame for {base_name} is empty. Not saving.")
+                  return
+
+              # Define archive path and filename (this part is already good for subfolders)
+              archive_folder_for_type = f"{s3_archive_path_base}{base_name}/" # e.g., .../archive/financial_metrics/
+              archive_filename = f"{today_str}_{base_name}.csv"
+              full_archive_s3_path = f"{archive_folder_for_type}{archive_filename}"
+
+              # Let's map your base_name to the S3 subfolder and the actual CSV filename
+              if base_name == "financial_metrics":
+                  latest_subfolder = "financial_metrics_table/"
+                  latest_csv_filename = "financial_metrics.csv" # The actual CSV file name inside the subfolder
+              elif base_name == "company_news":
+                  latest_subfolder = "company_news_table/"
+                  latest_csv_filename = "company_news.csv"
+              elif base_name == "daily_news":
+                  latest_subfolder = "daily_news_table/"
+                  latest_csv_filename = "daily_news.csv"
+              else:
+                  logging.error(f"Unknown base_name '{base_name}' for constructing S3 latest path.")
+                  return
+
+              full_latest_s3_path = f"{s3_latest_path_base}{latest_subfolder}{latest_csv_filename}"
+              # Example: s3://stock-data-collection-bucket/collected_data/latest/financial_metrics_table/financial_metrics.csv
+
+              try:
+                  # Save the new archive copy of the combined data
+                  wr.s3.to_csv(df, path=full_archive_s3_path, index=False)
+                  logging.info(f"Successfully saved combined archive data to {full_archive_s3_path}")
+
+                  # Save (overwrite) the latest copy with the combined data
+                  wr.s3.to_csv(df, path=full_latest_s3_path, index=False)
+                  logging.info(f"Successfully saved combined latest data to {full_latest_s3_path}")
+
+              except Exception as e:
+                  logging.error(f"Failed to save combined data for {base_name} to S3: {e}")
+
+          def get_gemini_response_with_backoff(model, prompt, max_retries=5, initial_delay=5):
+              delay = initial_delay
+              for attempt in range(max_retries):
+                  try:
+                      response = model.generate_content(prompt)
+                      if hasattr(response, 'text') and response.text:
+                          return response.text
+                      else:
+                          logging.warning(f"Gemini returned an empty or blocked response (attempt {attempt+1}). Raw: {response}")
+                          raise Exception("Empty or blocked response")
+                  except Exception as e:
+                      logging.warning(f"Gemini API call failed (attempt {attempt+1}/{max_retries}): {e}")
+                      if "429" in str(e) or "rate limit" in str(e).lower() or "Empty or blocked response" in str(e):
+                          if attempt < max_retries - 1:
+                              logging.info(f"Rate limited. Waiting for {delay} seconds...")
+                              time.sleep(delay)
+                              delay *= 2
+                          else:
+                              logging.error("Max retries reached. Skipping prompt.")
+                              return None
+                      else:
+                          logging.error(f"Non-retriable error: {e}. Skipping prompt.")
+                          return None
+              return None
+
+          def parse_gemini_json(text_response):
+              if not text_response: return None
+              try:
+                  # Attempt to find JSON content within various markdown-like blocks
+                  clean_text = text_response.strip()
+                  if clean_text.startswith("```") and clean_text.endswith("```"):
+                      # Remove the first line (e.g., ```json or ```text) and the last line (```)
+                      lines = clean_text.splitlines()
+                      if len(lines) > 2:
+                          clean_text = "\n".join(lines[1:-1]).strip()
+                      else: # Handle case where it's just ```{...}```
+                          clean_text = lines[0].strip()[3:-3].strip()
+
+
+                  # Fallback if the above didn't fully clean or if no triple backticks
+                  if clean_text.startswith("```python"):
+                      clean_text = clean_text.removeprefix("```python").strip()
+                  if clean_text.startswith("```json"):
+                      clean_text = clean_text.removeprefix("```json").strip()
+                  if clean_text.startswith("```text"): # Added this
+                      clean_text = clean_text.removeprefix("```text").strip()
+                  if clean_text.startswith("```"): # Generic ```
+                      clean_text = clean_text.removeprefix("```").strip()
+
+                  if clean_text.endswith("```"):
+                      clean_text = clean_text.removesuffix("```").strip()
+
+                  return json.loads(clean_text)
+              except json.JSONDecodeError as e:
+                  logging.error(f"Failed to parse JSON: {e}. Raw response for parsing: '{text_response}'")
+                  return None
+
+          # --- Data Collection Functions ---
+          # (These remain mostly the same - they collect *today's* data)
+
+          def collect_financial_metrics(tickers, today_str):
+              logging.info("Starting financial metrics collection for today...")
+              metrics_data = []
+              for ticker, name in tickers:
+                  logging.info(f"Collecting metrics for: {ticker}")
+                  try:
+                      stock = yf.Ticker(ticker)
+                      info = stock.info
+                      data_point = {'date': today_str, 'Ticker': ticker, 'Company': name}
+                      data_point['min_target'] = info.get('targetLowPrice')
+                      data_point['max_target'] = info.get('targetHighPrice')
+                      data_point['target_mean'] = info.get('targetMeanPrice')
+                      data_point['target_median'] = info.get('targetMedianPrice')
+                      data_point['number_analysts'] = info.get('numberOfAnalystOpinions')
+                      data_point['recommendationMean'] = info.get('recommendationMean')
+                      data_point['close'] = info.get('regularMarketPreviousClose')
+                      data_point['open'] = info.get('regularMarketOpen')
+                      data_point['high'] = info.get('regularMarketDayHigh')
+                      data_point['low'] = info.get('regularMarketDayLow')
+                      data_point['industry'] = info.get('industry')
+                      data_point['sector'] = info.get('sector')
+                      data_point['heldPercentInsiders'] = info.get('heldPercentInsiders')
+                      data_point['heldPercentInstitutions'] = info.get('heldPercentInstitutions')
+                      data_point['trailingPE'] = info.get('trailingPE')
+                      data_point['forwardPE'] = info.get('forwardPE')
+                      data_point['earningsGrowth'] = info.get('earningsGrowth')
+                      data_point['revenueGrowth'] = info.get('revenueGrowth')
+                      data_point['grossMargins'] = info.get('grossMargins')
+                      data_point['ebitdaMargins'] = info.get('ebitdaMargins')
+                      data_point['operatingMargins'] = info.get('operatingMargins')
+                      mean_price = info.get('targetMeanPrice')
+                      close_price = info.get('regularMarketPreviousClose')
+                      if mean_price is not None and close_price is not None and close_price != 0:
+                          data_point['percent_from_mean'] = ((mean_price - close_price) / close_price) * 100
+                      else:
+                          data_point['percent_from_mean'] = None
+                      metrics_data.append(data_point)
+                  except Exception as e:
+                      logging.error(f"Failed to get yfinance data for {ticker}: {e}")
+                  time.sleep(2)
+              logging.info("Finished financial metrics collection for today.")
+              return pd.DataFrame(metrics_data)
+
+          COMPANY_NEWS_COLUMNS = [
+              'date', 'Ticker', 'Company',
+              'news_Revenue', 'news_Managment', 'news_Legal',
+              'news_Technology', 'news_Financial'
+          ]
+
+          def collect_company_news(tickers, today_str, model):
+              logging.info("Starting company news sentiment collection for today...")
+              news_data = [] # This will store dictionaries before creating the DataFrame
+
+              for ticker, name in tickers:
+                  logging.info(f"Collecting news sentiment for: {ticker} ({name})")
+                  
+                  # Initialize data_point with all expected keys, defaulting to None for news items
+                  data_point = {col: None for col in COMPANY_NEWS_COLUMNS} # Initialize all to None
+                  data_point['date'] = today_str
+                  data_point['Ticker'] = ticker
+                  data_point['Company'] = name
+                  
+                  prompt = company_news_prompt.replace('{Company}', name)
+                  response_text = get_gemini_response_with_backoff(model, prompt)
+                  response_dict = parse_gemini_json(response_text)
+                  
+                  if response_dict:
+                      data_point['news_Revenue'] = response_dict.get('Revenue')
+                      data_point['news_Managment'] = response_dict.get('Management')
+                      data_point['news_Legal'] = response_dict.get('Legal')
+                      data_point['news_Technology'] = response_dict.get('Technology')
+                      data_point['news_Financial'] = response_dict.get('Financial')
+                  else:
+                      # This else block is actually covered by the initialization above,
+                      # but an explicit warning is still good.
+                      logging.warning(f"Could not get or parse news for {name}. News fields will remain None.")
+                      # The news_ fields are already None from the initialization
+
+                  news_data.append(data_point)
+                  time.sleep(3) # Keep your rate-limiting sleep
+
+              logging.info("Finished company news sentiment collection for today.")
+              
+              # Create DataFrame from the list of dictionaries
+              df = pd.DataFrame(news_data)
+              
+              # Ensure all canonical columns exist and are in the correct order.
+              # If a column from COMPANY_NEWS_COLUMNS was somehow missed in data_point initialization
+              # (shouldn't happen with the current dict comprehension init), this would add it with NaNs.
+              # More importantly, this ensures the column order.
+              df = df.reindex(columns=COMPANY_NEWS_COLUMNS)
+              
+              return df
+
+          def collect_daily_news(today_str, model):
+              logging.info("Starting daily global news sentiment collection for today...")
+              data_point = {'date': today_str}
+              response_text = get_gemini_response_with_backoff(model, daily_global_news_prompt)
+              response_dict = parse_gemini_json(response_text)
+              if response_dict:
+                  for t, s in response_dict.items():
+                      data_point[f'Daily_News_Topic_{t}_Sentiment'] = s
+                  logging.info("Finished daily global news sentiment collection for today.")
+                  return pd.DataFrame([data_point])
+              else:
+                  logging.error("Failed to collect daily news sentiment.")
+                  return pd.DataFrame()
+
+          # --- Main Execution ---
+          def main():
+              today_str = date.today().strftime('%Y-%m-%d')
+              logging.info(f"--- Starting Data Collection and Append Process for {today_str} ---")
+
+              try:
+                  model = genai.GenerativeModel(MODEL_NAME)
+                  logging.info(f"Google Gemini model '{MODEL_NAME}' initialized.")
+              except Exception as e:
+                  logging.error(f"Failed to initialize Gemini model: {e}")
+                  sys.exit(1)
+
+              # --- Process Financial Metrics ---
+              logging.info("Processing Financial Metrics...")
+              df_fin_historical = load_latest_historical_csv_from_s3("financial_metrics", S3_ARCHIVE_PATH_BASE)
+              df_fin_new = collect_financial_metrics(ticker_name_list, today_str)
+              df_fin_combined = pd.concat([df_fin_historical, df_fin_new], ignore_index=True)
+              # Remove duplicates: if same ticker on same date appears (e.g., from rerunning), keep the last entry
+              if not df_fin_combined.empty and 'Ticker' in df_fin_combined.columns and 'date' in df_fin_combined.columns:
+                  df_fin_combined.drop_duplicates(subset=['date', 'Ticker'], keep='last', inplace=True)
+              logging.info(f"Combined Financial Metrics Shape: {df_fin_combined.shape}")
+              save_combined_to_s3_csv(df_fin_combined, "financial_metrics", today_str, S3_ARCHIVE_PATH_BASE, S3_LATEST_PATH_BASE)
+
+              # --- Process Company News ---
+              logging.info("Processing Company News...")
+              df_company_news_historical = load_latest_historical_csv_from_s3("company_news", S3_ARCHIVE_PATH_BASE)
+              df_company_news_new = collect_company_news(ticker_name_list, today_str, model)
+              df_company_news_combined = pd.concat([df_company_news_historical, df_company_news_new], ignore_index=True)
+              if not df_company_news_combined.empty and 'Ticker' in df_company_news_combined.columns and 'date' in df_company_news_combined.columns:
+                  df_company_news_combined.drop_duplicates(subset=['date', 'Ticker'], keep='last', inplace=True)
+              logging.info(f"Combined Company News Shape: {df_company_news_combined.shape}")
+              save_combined_to_s3_csv(df_company_news_combined, "company_news", today_str, S3_ARCHIVE_PATH_BASE, S3_LATEST_PATH_BASE)
+
+              # --- Process Daily News ---
+              logging.info("Processing Daily News...")
+              df_daily_news_historical = load_latest_historical_csv_from_s3("daily_news", S3_ARCHIVE_PATH_BASE)
+              df_daily_news_new = collect_daily_news(today_str, model)
+              df_daily_news_combined = pd.concat([df_daily_news_historical, df_daily_news_new], ignore_index=True)
+              # Daily news is usually one row per day, so just keep last for a given date
+              if not df_daily_news_combined.empty and 'date' in df_daily_news_combined.columns:
+                  df_daily_news_combined.drop_duplicates(subset=['date'], keep='last', inplace=True)
+              logging.info(f"Combined Daily News Shape: {df_daily_news_combined.shape}")
+              save_combined_to_s3_csv(df_daily_news_combined, "daily_news", today_str, S3_ARCHIVE_PATH_BASE, S3_LATEST_PATH_BASE)
+
+              logging.info(f"--- Data Collection and Append Process for {today_str} Finished ---")
+
+          if __name__ == "__main__":
+              main()
+
+          EOF
+
+          # Set up Python virtual environment and install packages
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+          deactivate # Deactivate for now, cron will reactivate
+
+          # Set Gemini API Key persistently for ec2-user
+          echo "export GEMINI_API_KEY='${GeminiAPIKeyParameter}'" >> /home/ec2-user/.bashrc
+
+          # Set up cron job (runs as ec2-user)
+          # Ensure correct paths and adjust schedule as needed (11 AM Toronto EDT = 15:00 UTC)
+          echo "0 15 * * 1-5 /bin/bash -l -c 'source /home/ec2-user/stock_collector/venv/bin/activate && /home/ec2-user/stock_collector/venv/bin/python /home/ec2-user/stock_collector/stockCollectionFunction.py >> /home/ec2-user/stock_collector/cron.log 2>&1'" | crontab -u ec2-user -
+
+          # Change ownership of the project directory to ec2-user
+          chown -R ec2-user:ec2-user /home/ec2-user/stock_collector
+
+          # Signal completion (optional, for cfn-signal if used with WaitCondition)
+          # /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource DataCollectorInstance --region ${AWS::Region}
+
+  # --- IAM Role for AWS Glue Crawler ---
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Glue-StockCollector-CrawlerRole-CFN
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns: # Using managed policies for simplicity here as per user's preference
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess # As per user's previous choice for simplicity
+        # For least privilege, you'd replace AmazonS3FullAccess with a custom policy
+        # granting read access to specific S3 data paths and write to Glue's own S3 paths if needed.
+      Tags:
+        - Key: Name
+          Value: Glue-StockCollector-CrawlerRole
+
+  # --- AWS Glue Data Catalog Database ---
+  InvestmentDataGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: investment_dashboard_db # Your database name
+        Description: Database for the Investment Insights Dashboard data.
+
+  # --- AWS Glue Crawler for Financial Metrics ---
+  FinancialMetricsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: FinancialMetricsLatestCrawler-CFN
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref InvestmentDataGlueDatabase # Reference the database created above
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${StockDataS3Bucket}/collected_data/latest/financial_metrics_table/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE # Or LOG
+        DeleteBehavior: LOG # Or DEPRECATE_IN_DATABASE, DELETE_FROM_DATABASE
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        Name: FinancialMetricsLatestCrawler
+
+  # --- AWS Glue Crawler for Company News ---
+  CompanyNewsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: CompanyNewsLatestCrawler-CFN
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref InvestmentDataGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${StockDataS3Bucket}/collected_data/latest/company_news_table/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        Name: CompanyNewsLatestCrawler
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for stock data.
+    Value: !Ref StockDataS3Bucket
+  EC2InstancePublicIp:
+    Description: Public IP address of the Data Collector EC2 instance.
+    Value: !GetAtt DataCollectorInstance.PublicIp
+  EC2InstanceId:
+    Description: Instance ID of the Data Collector EC2 instance.
+    Value: !Ref DataCollectorInstance
