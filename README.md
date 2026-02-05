@@ -11,6 +11,7 @@ This project demonstrates **Infrastructure as Code (IaC)** principles. Instead o
 The system launches an **EC2 instance**, installs dependencies, configures a **Cron job** for daily execution, and sets up **AWS Glue Crawlers** to catalogue the data for downstream analytics. It integrates **Google Gemini AI** to perform sentiment analysis on financial news.
 
 ## 🏗️ Architecture
+![Architecture Diagram](assets/aws-invest.jpg)
 The CloudFormation template provisions the following resources:
 1.  **Compute (EC2):** A `t2.micro` instance acting as the worker node.
 2.  **Storage (S3):** A dedicated bucket (`stock-data-collection-bucket`) with `archive/` and `latest/` prefixes.
