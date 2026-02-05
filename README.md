@@ -12,6 +12,7 @@ The system launches an **EC2 instance**, installs dependencies, configures a **C
 
 ## 🏗️ Architecture
 ![Architecture Diagram](assets/aws-invest.jpg)
+
 The CloudFormation template provisions the following resources:
 1.  **Compute (EC2):** A `t2.micro` instance acting as the worker node.
 2.  **Storage (S3):** A dedicated bucket (`stock-data-collection-bucket`) with `archive/` and `latest/` prefixes.
