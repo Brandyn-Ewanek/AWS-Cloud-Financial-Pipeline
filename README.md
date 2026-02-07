@@ -40,7 +40,6 @@ The CloudFormation template provisions the following resources:
 
 ## 📂 Repository Structure
 * `infrastructure.yaml`: The master CloudFormation template.
-* `src/stock_collector.py`: The extraction logic (Python) deployed to the EC2 instance.
 
 ## 🚀 Deployment Instructions
 1.  Login to AWS Console -> **CloudFormation**.
